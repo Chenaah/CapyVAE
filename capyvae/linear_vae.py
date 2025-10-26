@@ -12,10 +12,6 @@ import pytorch_lightning as pl
 from torch.nn import functional as F
 import wandb
 from torchsummary import summary
-# from cilia2d.log_tools import play_and_record, blueprint
-# from cilia2d.random_robots import gen_random_robot_draw
-# from cilia2d.util import get_conv_out_shape, get_conv_out_size, matrix2img
-# from cilia2d import CILIA2D_ROOT_DIR
 
 class BaseVAE(pl.LightningModule):
     def __init__(self, hparams):
