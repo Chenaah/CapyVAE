@@ -1,4 +1,3 @@
-""" Trains a convnet for the shapes task """
 import datetime
 import os
 import argparse
@@ -14,62 +13,24 @@ from omegaconf import DictConfig, OmegaConf
 import tensorflow as tf
 from trieste.space import Box, DiscreteSearchSpace
 import torch
-# import hydra
-# import nevergrad as ng
-from twist_controller.sim.evolution.encoding_wrapper import decode_onehot, extent_to_5x1, polish, polish_4x, polish_asym
-from twist_controller.sim.evolution.vae import utils
-# from cilia2d import CILIA2D_ROOT_DIR
-# from cilia2d.util import create_log_dir, get_freer_gpu
-from twist_controller.sim.evolution.vae.linear_vae import LinearVAE
-# from twist_controller.sim.evolution.vae.qlogei import QLogEI
-# from twist_controller.sim.evolution.vae.turbo import TuRBO
+from linear_vae import LinearVAE
 from twist_controller.sim.evolution.vae.abo import AsynchronousBO
 from weighted_dataset import WeightedDataset
 from twist_controller.utils.logger import LoggerCallback
-from twist_controller.utils.others import get_freer_gpu
 
 
-
-def flatten_values_to_designs(values, device, logger=None):
-    # values: (n, 16*19)
-    if not isinstance(values, torch.Tensor):
-        values = torch.tensor(values, device=device)
-    assert len(values.shape) == 2
-    assert values.shape[1] == 16*19, f"Wrong shape {values.shape}"
-    designs = decode_onehot(values, max_idx=17)
-    polished_designs = [polish_asym(design) for design in designs]
-
-    if logger is not None:
-        # logger.log(("latent", values), "one_hot", one_hot)
-        logger.log(("latent", values), "design", designs[0])
-        logger.log(("latent", values), "polished_design", polished_designs[0])
-        logger.flush()
-    return polished_designs[0]
-
-# class DebugCallback(pl.Callback):
+class DebugCallback(pl.Callback):
+    def on_validation_epoch_end(self, trainer, pl_module):
+        pass
 
 
-#     def on_validation_epoch_end(self, trainer, pl_module):
-#         from twist_controller.sim.evolution.test.inverse_vae import TRIPOD_DP, TRIPOD_ONEHOT
-#         # Visualize latent space
-#         # self.visualize_latent_space(pl_module, 20) # Buggy
-#         tripod_onehot = torch.tensor(TRIPOD_ONEHOT).to(pl_module.device)
-#         tripod_dp = TRIPOD_DP
-
-#         tripod_latent, logstd = pl_module.encode_to_params(tripod_onehot)
-#         print("Latent: ", tripod_latent)
-#         one_hot = pl_module.decoder(tripod_latent)
-#         designs = decode_onehot(one_hot, max_idx=17)
-#         print("Decoded Designs: ", designs)
-
-
-
-class VAETrainer():
-    def __init__(self, cfg, wandb_run=None, optimizer=None, logger=None, optimizer_kwargs={}):
+class VAE():
+    def __init__(self, cfg=None, dataset=None, wandb_run=None, optimizer=None, logger=None, optimizer_kwargs={}):
          # Create arg parser
-        self.hparams = cfg
+        self.hparams = cfg if cfg is not None else get_vae_cfg()
+        self.hparams.dataset_path = dataset
         # log_path = create_log_dir("pretrain", hparams.dataset, hparams.max_epochs, 1, note=f"ls{hparams.latent_dim}", log_folder_name=os.path.join(CILIA2D_ROOT_DIR, "logs", "retraining"))
-        self.log_path = cfg.log_dir 
+        self.log_path = self.hparams.log_dir 
         self.n_workers = optimizer_kwargs.get("n_workers", 2)
         self.use_result_buffer = optimizer_kwargs.get("use_result_buffer", True)
         self.load_gp = optimizer_kwargs.get("load_gp", None)
@@ -125,7 +86,7 @@ class VAETrainer():
                         ), 
                         RichProgressBar(theme=RichProgressBarTheme(progress_bar="red", progress_bar_finished="green")),
                         LoggerCallback(),
-                        # DebugCallback()
+                        DebugCallback()
                         ],
             logger=self.wandb_logger,
         )
@@ -153,39 +114,8 @@ class VAETrainer():
                                               likelihood_variance= self.likelihood_variance
                                               )
             
-        elif optimizer == "dbo":
-            # With onehot search space
-            self.bboptimizer = AsynchronousBO(dim=19*16, # Hardcoded for now
-                                              n_init=self.n_workers,
-                                              lb=0,
-                                              ub=1,
-                                              load_gp=self.load_gp,
-                                              log_dir=os.path.join(os.path.dirname(self.log_path), "abo_models"),
-                                              likelihood_variance= self.likelihood_variance
-                                              )
-        elif optimizer == "dbo2":
-            # With true discrete search space
-            # The whole onehot space
-            points = []
-            for i in range(16):
-                for j in range(19):
-                    onehot = [[0]*19]*16
-                    onehot[j] = 1
-                    points.append(onehot) # this is wrong...
-            points = tf.constant(points)
-            search_space = DiscreteSearchSpace(points)
-            self.bboptimizer = AsynchronousBO(dim=None,
-                                              n_init=self.n_workers,
-                                              lb=lb,
-                                              ub=ub,
-                                              load_gp=self.load_gp,
-                                              log_dir=os.path.join(os.path.dirname(self.log_path), "abo_models"),
-                                              likelihood_variance= self.likelihood_variance,
-                                              search_space=search_space
-                                              )
-            
+        
         self.param_dict = {}  # tuple(polished_design) -> param
-
         self.result_buffer = {}
 
 
@@ -194,6 +124,7 @@ class VAETrainer():
         print("Training started")
         self.trainer.fit(self.model, datamodule=self.data)
         print("Training finished")
+
 
     def test_vae(self):
         data = self.data.data_val
@@ -338,8 +269,7 @@ def get_vae_cfg():
 
 if __name__ == "__main__":
 
-    cfg = get_vae_cfg()
-    vae_trainer = VAETrainer(cfg, optimizer="abo")
+    vae_trainer = VAE(optimizer="abo", dataset="designs_asym_filtered_onehot.pt")
     vae_trainer.train_vae()
     vae_trainer.test_vae()
     init_designs = vae_trainer.get_init_designs()
