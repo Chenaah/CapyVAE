@@ -10,9 +10,10 @@ Originally developed for the [ModularLegs project](https://modularlegs.github.io
 
 This project is part of an ongoing development of a modular embodied AI ecosystem. Related projects include:
 
-- **[metamachine](https://github.com/Chenaah/metamachine)**
-- **[CapyRL](https://github.com/Chenaah/CapyRL)**
-- **[capybarish](https://github.com/Chenaah/capybarish)**
+- **[metamachine](https://github.com/Chenaah/metamachine)** - A simulation framework for modular robots.
+- **[capybarish](https://github.com/Chenaah/capybarish)** - A lightweight communication middleware.
+- **[CapyRL](https://github.com/Chenaah/CapyRL)** - A lightweight JAX-based reinforcement learning library.
+- **[CapyFormer](git@github.com:Chenaah/CapyFormer.git)** - A simple, flexible Transformer library for locomotion control.
 
 ---
 
