@@ -10,10 +10,7 @@ from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import RichProgressBar
 from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
 from omegaconf import DictConfig, OmegaConf
-import tensorflow as tf
-from trieste.space import Box, DiscreteSearchSpace
 import torch
-from drone_dataset import DroneDataset
 from linear_vae import LinearVAE
 from twist_controller.sim.evolution.vae.abo import AsynchronousBO
 from weighted_dataset import WeightedDataset
@@ -294,19 +291,111 @@ class VAE():
         print("Training finished")
 
 
-    def test_vae(self):
-        data = self.data.data_val
-        indices = torch.randint(low=0, high=data.size(0), size=(10,))
-        sampled_data = data[indices]
-        print("BEFORE: ")
-        for d in sampled_data:
-            print(d)
-        sampled_data = torch.tensor(sampled_data, device=self.model.device, dtype=self.model.dtype)
-        mu, logstd = self.model.encode_to_params(sampled_data)
-        designs = self.model.decoder(mu)
-        print("AFTER: ")
-        for d in designs:
-            print(d)
+    def test_vae(self, n_samples=5, n_latent_samples=3, verbose=True):
+        """
+        Test VAE model to provide intuition about reconstruction and generation.
+        
+        Args:
+            n_samples: Number of validation samples to test reconstruction on
+            n_latent_samples: Number of new designs to generate from latent space
+            verbose: Whether to print detailed output
+        
+        Returns:
+            dict: Contains reconstruction errors and generated samples
+        """
+        self.model.eval()
+        
+        with torch.no_grad():
+            # ========== Part 1: Test Reconstruction Quality ==========
+            if verbose:
+                print("\n" + "="*60)
+                print("PART 1: RECONSTRUCTION TEST")
+                print("="*60)
+                print("Testing how well the VAE reconstructs existing data points\n")
+            
+            data = self.data.data_val
+            indices = torch.randint(low=0, high=data.size(0), size=(n_samples,))
+            original_data = data[indices]
+            
+            # Move to device
+            original_data_tensor = original_data.clone().detach().to(
+                device=self.model.device, 
+                dtype=self.model.dtype
+            )
+            
+            # Encode and decode
+            mu, logstd = self.model.encode_to_params(original_data_tensor)
+            reconstructed = self.model.decoder(mu)
+            
+            # Calculate reconstruction error
+            mse_errors = torch.mean((original_data_tensor - reconstructed) ** 2, dim=1)
+            avg_mse = torch.mean(mse_errors).item()
+            
+            if verbose:
+                print(f"Sample\t{'Original (first 10 dims)':<30} | {'Reconstructed (first 10 dims)':<30} | MSE")
+                print("-" * 95)
+                for i, (orig, recon, err) in enumerate(zip(original_data, reconstructed, mse_errors)):
+                    orig_str = str(orig[:10].cpu().numpy().round(3))
+                    recon_str = str(recon[:10].cpu().numpy().round(3))
+                    print(f"  {i+1}\t{orig_str:<30} | {recon_str:<30} | {err.item():.6f}")
+                
+                print(f"\nAverage Reconstruction MSE: {avg_mse:.6f}")
+                print(f"Latent vectors (mu) shape: {mu.shape}")
+            
+            # ========== Part 2: Sample New Designs from Latent Space ==========
+            if verbose:
+                print("\n" + "="*60)
+                print("PART 2: GENERATION FROM LATENT SPACE")
+                print("="*60)
+                print("Generating new designs by sampling from latent space\n")
+            
+            # Sample from prior (standard normal distribution)
+            z_samples = self.model.sample_prior(n_latent_samples)
+            generated_designs = self.model.decoder(z_samples)
+            
+            if verbose:
+                print(f"Sampled {n_latent_samples} random latent vectors from N(0,1)")
+                print(f"Generated designs shape: {generated_designs.shape}\n")
+                print("Generated Designs (first 10 dimensions):")
+                print("-" * 60)
+                for i, design in enumerate(generated_designs):
+                    design_str = str(design[:10].cpu().numpy().round(3))
+                    print(f"  Design {i+1}: {design_str}")
+            
+            # ========== Part 3: Latent Space Statistics ==========
+            if verbose:
+                print("\n" + "="*60)
+                print("PART 3: LATENT SPACE STATISTICS")
+                print("="*60)
+                
+                # Encode a larger batch to see latent space distribution
+                batch_size = min(100, data.size(0))
+                sample_indices = torch.randint(low=0, high=data.size(0), size=(batch_size,))
+                sample_batch = data[sample_indices].clone().detach().to(
+                    device=self.model.device, 
+                    dtype=self.model.dtype
+                )
+                mu_batch, logstd_batch = self.model.encode_to_params(sample_batch)
+                
+                print(f"\nLatent space analysis (from {batch_size} samples):")
+                print(f"  Latent dimension: {self.hparams.latent_dim}")
+                print(f"  Mean of latent means: {mu_batch.mean(dim=0).cpu().numpy().round(3)}")
+                print(f"  Std of latent means:  {mu_batch.std(dim=0).cpu().numpy().round(3)}")
+                print(f"  Mean of latent stds:  {torch.exp(logstd_batch).mean(dim=0).cpu().numpy().round(3)}")
+            
+            print("\n" + "="*60 + "\n")
+        
+        self.model.train()
+        
+        # Return results for programmatic access
+        return {
+            'reconstruction_mse': avg_mse,
+            'original_samples': original_data.cpu().numpy(),
+            'reconstructed_samples': reconstructed.cpu().numpy(),
+            'latent_vectors': mu.cpu().numpy(),
+            'generated_designs': generated_designs.cpu().numpy(),
+            'latent_samples': z_samples.cpu().numpy()
+        }
 
     def _latent_to_design(self, latent_value):
         latent_value = torch.tensor(np.array([latent_value]), device=self.model.device, dtype=self.model.dtype)
@@ -437,21 +526,21 @@ def get_vae_cfg():
 
 if __name__ == "__main__":
     # Example 1: Simple usage with file path
-    vae_trainer = VAE(dataset="designs_asym_filtered_onehot.pt")
+    vae_trainer = VAE(dataset="data/designs_asym_filtered_onehot.pt", max_epochs=2)
     vae_trainer.train_vae()
     vae_trainer.test_vae()
     
-    # Example 2: With custom dataset (e.g., from external source)
-    from drone_dataset import DroneDataset
-    drone_data = DroneDataset("/home/chen/LAB/CapyVAE/drone/log.txt")
-    configs, scores = drone_data.export_to_array(include_added_mass=False)
+    # # Example 2: With custom dataset (e.g., from external source)
+    # from drone_dataset import DroneDataset
+    # drone_data = DroneDataset("/home/chen/LAB/CapyVAE/drone/log.txt")
+    # configs, scores = drone_data.export_to_array(include_added_mass=False)
     
-    vae_trainer = VAE(
-        dataset=(configs, scores),  # Pass as tuple
-        optimizer="abo",
-        latent_dim=8,
-        max_epochs=2
-    )
-    vae_trainer.train_vae()
-    vae_trainer.test_vae()
-    init_designs = vae_trainer.get_init_designs()
+    # vae_trainer = VAE(
+    #     dataset=(configs, scores),  # Pass as tuple
+    #     optimizer="abo",
+    #     latent_dim=8,
+    #     max_epochs=2
+    # )
+    # vae_trainer.train_vae()
+    # vae_trainer.test_vae()
+    # init_designs = vae_trainer.get_init_designs()

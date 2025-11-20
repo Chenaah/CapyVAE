@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capyvae"
+version = "0.1.0"
+description = "A VAE library for design optimization, originally developed for the ModularLegs project"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Chen Yu", email = "your.email@example.com"}
+]
+keywords = ["vae", "variational autoencoder", "design optimization", "pytorch", "lightning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "numpy",
+    "torch>=1.10.0",
+    "pytorch-lightning>=2.0.0",
+    "omegaconf",
+    "torchsummary",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "black",
+    "flake8",
+    "mypy",
+]
+wandb = [
+    "wandb",
+]
+
+[project.urls]
+Homepage = "https://github.com/Chenaah/CapyVAE"
+Repository = "https://github.com/Chenaah/CapyVAE"
+Documentation = "https://github.com/Chenaah/CapyVAE"
+"Bug Reports" = "https://github.com/Chenaah/CapyVAE/issues"
+
+[tool.setuptools]
+packages = ["capyvae"]
+
+[tool.setuptools.package-data]
+capyvae = ["py.typed"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
