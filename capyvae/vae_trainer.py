@@ -247,6 +247,7 @@ class VAE():
             devices=[self.model.device.index] if self.model.device.type == 'cuda' else 'auto',
             default_root_dir=self.log_path,
             max_epochs=self.hparams.max_epochs,
+            enable_model_summary=True,
             callbacks=[
                 pl.callbacks.ModelCheckpoint(
                     every_n_epochs=1, 
@@ -346,7 +347,8 @@ class VAE():
                 print("="*60)
                 print("Testing how well the VAE reconstructs existing data points\n")
             
-            data = self.data.data_val
+            # data = self.data.data_val
+            data = self.data.data_train
             indices = torch.randint(low=0, high=data.size(0), size=(n_samples,))
             original_data = data[indices]
             

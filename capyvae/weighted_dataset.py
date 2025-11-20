@@ -263,6 +263,9 @@ class WeightedDataset(pl.LightningDataModule):
         # Compute normalization statistics from training data BEFORE splitting
         # This ensures we normalize based on training distribution
         N_val = int(all_data.shape[0] * self.val_frac)
+        if N_val < self.batch_size:
+            print("Warning: Validation set too small for batch size.")
+            N_val = self.batch_size
         train_data_for_stats = all_data[N_val:]
         
         if self.normalize:

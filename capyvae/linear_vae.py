@@ -50,20 +50,30 @@ class BaseVAE(pl.LightningModule):
     def forward(self, x):
         """ calculate the VAE ELBO """
         mu, logstd = self.encode_to_params(x)
-        std = torch.exp(logstd)
-        std = torch.clamp(std, min=1e-6)
-        try:
-            encoder_distribution = torch.distributions.Normal(
-                loc=mu, scale=std
-            )
-        except ValueError as e:
-            pdb.set_trace()
-        z_sample = encoder_distribution.rsample()
+        
+        # Use deterministic encoding when beta is very low or zero
+        # This prevents posterior collapse
+        if self.beta < 0.01 and not self.beta_annealing:
+            # Deterministic autoencoder mode - use mu directly
+            z_sample = mu
+            kl_loss = torch.zeros(1, device=x.device)
+        else:
+            # Standard VAE with sampling
+            std = torch.exp(logstd)
+            std = torch.clamp(std, min=1e-6)
+            try:
+                encoder_distribution = torch.distributions.Normal(
+                    loc=mu, scale=std
+                )
+            except ValueError as e:
+                pdb.set_trace()
+            z_sample = encoder_distribution.rsample()
+            
+            # Manual formula for kl divergence (more numerically stable!)
+            kl_div = 0.5 * (torch.exp(2 * logstd) + mu.pow(2) - 1.0 - 2 * logstd)
+            kl_loss = kl_div.sum() / z_sample.shape[0]
+        
         reconstruction_loss = self.decoder_loss(z_sample, x)
-
-        # Manual formula for kl divergence (more numerically stable!)
-        kl_div = 0.5 * (torch.exp(2 * logstd) + mu.pow(2) - 1.0 - 2 * logstd)
-        kl_loss = kl_div.sum() / z_sample.shape[0]
 
         # Final loss
         loss = reconstruction_loss + self.beta * kl_loss
@@ -206,7 +216,10 @@ class LinearVAE(BaseVAE):
         self.encoder = nn.Sequential(*modules)
 
         # Decoder
-        modules = [nn.Linear(self.latent_dim, hidden_dims[-1])]
+        modules = [
+            nn.Linear(self.latent_dim, hidden_dims[-1]),
+            nn.ReLU()  # FIXED: Add ReLU after first layer
+        ]
         for i in range(len(hidden_dims) - 1, 0, -1):
             modules.append(nn.Linear(hidden_dims[i], hidden_dims[i-1]))
             modules.append(nn.ReLU())
