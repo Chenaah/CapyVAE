@@ -26,6 +26,11 @@ class BaseVAE(pl.LightningModule):
         # Register buffers for prior
         self.register_buffer("prior_mu", torch.zeros([self.latent_dim]))
         self.register_buffer("prior_sigma", torch.ones([self.latent_dim]))
+        
+        # Register buffers for data normalization (for denormalization of generated samples)
+        # Will be set by the trainer if normalization is enabled
+        self.register_buffer("data_mean", None)
+        self.register_buffer("data_std", None)
 
         # Create beta
         self.beta = hparams.beta_final
@@ -80,6 +85,42 @@ class BaseVAE(pl.LightningModule):
         return torch.distributions.Normal(self.prior_mu, self.prior_sigma).sample(
             torch.Size([n_samples])
         )
+    
+    def set_normalization_stats(self, mean: torch.Tensor, std: torch.Tensor):
+        """
+        Set normalization statistics for denormalization.
+        
+        Args:
+            mean: Mean tensor used for normalization
+            std: Standard deviation tensor used for normalization
+        """
+        self.data_mean = mean.to(self.device)
+        self.data_std = std.to(self.device)
+    
+    def denormalize(self, normalized_data: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize data back to original scale.
+        
+        Args:
+            normalized_data: Normalized data tensor
+            
+        Returns:
+            Denormalized data tensor
+        """
+        if self.data_mean is None or self.data_std is None:
+            # No normalization was applied
+            return normalized_data
+        
+        return normalized_data * self.data_std + self.data_mean
+    
+    def is_normalized(self) -> bool:
+        """
+        Check if the model has normalization enabled.
+        
+        Returns:
+            True if normalization statistics are set, False otherwise
+        """
+        return self.data_mean is not None and self.data_std is not None
 
     def _increment_beta(self):
 

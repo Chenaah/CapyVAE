@@ -11,9 +11,9 @@ from pytorch_lightning.callbacks import RichProgressBar
 from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
 from omegaconf import DictConfig, OmegaConf
 import torch
-from linear_vae import LinearVAE
+from capyvae.linear_vae import LinearVAE
 from twist_controller.sim.evolution.vae.abo import AsynchronousBO
-from weighted_dataset import WeightedDataset
+from capyvae.weighted_dataset import WeightedDataset
 from twist_controller.utils.logger import LoggerCallback
 
 
@@ -84,6 +84,8 @@ class VAE():
         weight_type: str = "rank",
         rank_weight_k: float = 1e-3,
         weight_quantile: float = None,
+        # Data normalization
+        normalize: bool = False,
         # Device and paths
         device: str = "cuda:0",
         log_dir: str = None,
@@ -124,6 +126,8 @@ class VAE():
             weight_type: Weighting strategy ('rank', 'fb', etc.)
             rank_weight_k: Rank weighting coefficient
             weight_quantile: Quantile for filtering (fb mode)
+            normalize: If True, normalizes data to zero mean and unit variance
+                      Automatically denormalizes generated samples
             device: Device ('cuda:0', 'cpu', etc.)
             log_dir: Logging directory (auto-generated if None)
             load_from_checkpoint: Path to checkpoint file
@@ -167,6 +171,7 @@ class VAE():
             "weight_type": weight_type,
             "rank_weight_k": rank_weight_k,
             "weight_quantile": weight_quantile,
+            "normalize": normalize,
             "device": device,
         })
         
@@ -216,6 +221,7 @@ class VAE():
                 weight_type=self.hparams.weight_type,
                 rank_weight_k=self.hparams.rank_weight_k,
                 weight_quantile=self.hparams.weight_quantile,
+                normalize=self.hparams.normalize,
             )
         
         self.data.setup("init")
@@ -223,6 +229,12 @@ class VAE():
 
         # Load model
         self.model = LinearVAE(self.hparams).to(device=torch.device(self.hparams.device))
+        
+        # Set normalization statistics in the model if available
+        norm_stats = self.data.get_normalization_stats()
+        if norm_stats is not None:
+            self.model.set_normalization_stats(norm_stats['mean'], norm_stats['std'])
+            print(f"✓ Normalization enabled in model")
         if self.hparams.load_from_checkpoint is not None:
             self.model = LinearVAE.load_from_checkpoint(
                 self.hparams.load_from_checkpoint, 
@@ -285,13 +297,34 @@ class VAE():
 
 
     def train_vae(self):
+        """
+        Train the VAE model.
+        
+        Alias for train() method for better clarity.
+        """
+        self.train()
+    
+    def train(self):
         # Fit
         print("Training started")
         self.trainer.fit(self.model, datamodule=self.data)
         print("Training finished")
 
-
     def test_vae(self, n_samples=5, n_latent_samples=3, verbose=True):
+        """
+        Test VAE model (user-friendly alias for test()).
+        
+        Args:
+            n_samples: Number of validation samples to test reconstruction on
+            n_latent_samples: Number of new designs to generate from latent space
+            verbose: Whether to print detailed output
+        
+        Returns:
+            dict: Contains reconstruction errors and generated samples
+        """
+        return self.test(n_samples=n_samples, n_latent_samples=n_latent_samples, verbose=verbose)
+
+    def test(self, n_samples=5, n_latent_samples=3, verbose=True):
         """
         Test VAE model to provide intuition about reconstruction and generation.
         
@@ -353,12 +386,20 @@ class VAE():
             z_samples = self.model.sample_prior(n_latent_samples)
             generated_designs = self.model.decoder(z_samples)
             
+            # Denormalize if normalization was applied
+            generated_designs_denorm = self.model.denormalize(generated_designs)
+            
             if verbose:
                 print(f"Sampled {n_latent_samples} random latent vectors from N(0,1)")
-                print(f"Generated designs shape: {generated_designs.shape}\n")
+                print(f"Generated designs shape: {generated_designs.shape}")
+                if self.model.is_normalized():
+                    print(f"✓ Denormalization applied to generated samples\n")
+                else:
+                    print(f"(No normalization was used)\n")
+                
                 print("Generated Designs (first 10 dimensions):")
                 print("-" * 60)
-                for i, design in enumerate(generated_designs):
+                for i, design in enumerate(generated_designs_denorm):
                     design_str = str(design[:10].cpu().numpy().round(3))
                     print(f"  Design {i+1}: {design_str}")
             
@@ -393,14 +434,35 @@ class VAE():
             'original_samples': original_data.cpu().numpy(),
             'reconstructed_samples': reconstructed.cpu().numpy(),
             'latent_vectors': mu.cpu().numpy(),
-            'generated_designs': generated_designs.cpu().numpy(),
-            'latent_samples': z_samples.cpu().numpy()
+            'generated_designs': generated_designs_denorm.cpu().numpy(),  # Return denormalized
+            'latent_samples': z_samples.cpu().numpy(),
+            'is_normalized': self.model.is_normalized()
         }
 
     def _latent_to_design(self, latent_value):
         latent_value = torch.tensor(np.array([latent_value]), device=self.model.device, dtype=self.model.dtype)
         designs = self.model.decoder(latent_value)
         return designs[0]
+    
+    def denormalize(self, normalized_data: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize data back to original scale.
+        
+        This is a convenience method that calls the model's denormalize function.
+        Use this to convert generated samples back to the original data scale.
+        
+        Args:
+            normalized_data: Normalized data tensor (can be on CPU or GPU)
+            
+        Returns:
+            Denormalized data tensor (same device as input)
+            
+        Example:
+            >>> z = vae_trainer.model.sample_prior(10)
+            >>> generated = vae_trainer.model.decoder(z)
+            >>> original_scale = vae_trainer.denormalize(generated)
+        """
+        return self.model.denormalize(normalized_data)
 
     def get_init_designs(self):
         assert self.bboptimizer is not None, "Optimizer not set up"

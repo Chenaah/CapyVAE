@@ -63,6 +63,7 @@ class WeightedDataset(pl.LightningDataModule):
         rank_weight_k: float = 1e-3,
         weight_quantile: Optional[float] = None,
         num_workers: int = NUM_WORKERS,
+        normalize: bool = False,
         # Legacy support - if cfg/hparams object is passed as first arg
         **kwargs
     ):
@@ -84,6 +85,8 @@ class WeightedDataset(pl.LightningDataModule):
             rank_weight_k: Rank weighting parameter
             weight_quantile: Quantile for filtering (used in fb weighting)
             num_workers: Number of dataloader workers
+            normalize: If True, normalizes data to zero mean and unit variance
+                      Stores statistics for denormalization
             **kwargs: Additional parameters
         """
         super().__init__()
@@ -105,6 +108,7 @@ class WeightedDataset(pl.LightningDataModule):
             self.rank_weight_k = getattr(data, 'rank_weight_k', rank_weight_k)
             self.weight_quantile = getattr(data, 'weight_quantile', weight_quantile)
             self.num_workers = num_workers
+            self.normalize = getattr(data, 'normalize', normalize)
         else:
             # New flexible API mode
             self._legacy_mode = False
@@ -116,6 +120,7 @@ class WeightedDataset(pl.LightningDataModule):
             self.rank_weight_k = rank_weight_k
             self.weight_quantile = weight_quantile
             self.num_workers = num_workers
+            self.normalize = normalize
             
             # Create a minimal cfg object for compatibility with utils.DataWeighter
             self.cfg = type('Config', (), {
@@ -123,6 +128,10 @@ class WeightedDataset(pl.LightningDataModule):
                 'rank_weight_k': self.rank_weight_k,
                 'weight_quantile': self.weight_quantile,
             })()
+        
+        # Normalization statistics (computed during setup)
+        self.data_mean = None
+        self.data_std = None
         
 
     def prepare_data(self):
@@ -251,8 +260,28 @@ class WeightedDataset(pl.LightningDataModule):
         assert all_properties.shape[0] == all_data.shape[0]
         self.data_shape = all_data.shape
 
-
+        # Compute normalization statistics from training data BEFORE splitting
+        # This ensures we normalize based on training distribution
         N_val = int(all_data.shape[0] * self.val_frac)
+        train_data_for_stats = all_data[N_val:]
+        
+        if self.normalize:
+            # Compute statistics on training data only
+            self.data_mean = train_data_for_stats.mean(dim=0, keepdim=True)
+            self.data_std = train_data_for_stats.std(dim=0, keepdim=True)
+            
+            # Avoid division by zero (for constant features)
+            self.data_std = torch.clamp(self.data_std, min=1e-8)
+            
+            # Normalize all data
+            all_data = (all_data - self.data_mean) / self.data_std
+            print(f"✓ Data normalized: mean={self.data_mean.mean().item():.4f}, std={self.data_std.mean().item():.4f}")
+        else:
+            # No normalization - store None
+            self.data_mean = None
+            self.data_std = None
+
+        # Split into train/val after normalization
         self.data_val = all_data[:N_val]
         self.prop_val = all_properties[:N_val]
         self.data_train = all_data[N_val:]
@@ -328,3 +357,17 @@ class WeightedDataset(pl.LightningDataModule):
             sampler=self.val_sampler,
             drop_last=True,
         )
+    
+    def get_normalization_stats(self):
+        """
+        Get normalization statistics for denormalization.
+        
+        Returns:
+            dict: Dictionary with 'mean' and 'std' tensors, or None if not normalized
+        """
+        if self.normalize and self.data_mean is not None and self.data_std is not None:
+            return {
+                'mean': self.data_mean,
+                'std': self.data_std
+            }
+        return None
