@@ -149,6 +149,10 @@ class LinearVAE(BaseVAE):
         # input_shape = (n_types, hparams.matrix_size, hparams.matrix_size)
         hidden_dims = hparams.hidden_dims.copy()
         self.input_size = hparams.input_size
+        
+        # Set reconstruction loss type: 'bernoulli' for binary data, 'mse' for continuous
+        # Can be auto-detected or manually set via hparams
+        self.reconstruction_loss_type = getattr(hparams, 'reconstruction_loss', 'auto')
 
         # Encoder
         modules = []
@@ -183,10 +187,42 @@ class LinearVAE(BaseVAE):
 
 
     def decoder_loss(self, z, x_orig):
-        """ return negative Bernoulli log prob """
-        logits = self.decoder(z)
-        dist = distributions.Bernoulli(logits=logits)
-        return -dist.log_prob(x_orig).sum() / z.shape[0]
+        """
+        Calculate reconstruction loss with automatic loss type detection.
+        
+        Supports:
+        - 'bernoulli': For binary data (0s and 1s), uses Bernoulli log-likelihood
+        - 'mse': For continuous data, uses Mean Squared Error
+        - 'auto': Automatically detects based on data values
+        """
+        reconstruction = self.decoder(z)
+        
+        # Auto-detect loss type on first call if set to 'auto'
+        if self.reconstruction_loss_type == 'auto':
+            # Check if data is binary (all values are 0 or 1)
+            unique_vals = torch.unique(x_orig)
+            is_binary = len(unique_vals) <= 2 and torch.all((unique_vals == 0) | (unique_vals == 1))
+            
+            if is_binary:
+                self.reconstruction_loss_type = 'bernoulli'
+                print(f"🔍 Auto-detected binary data → Using Bernoulli loss")
+            else:
+                self.reconstruction_loss_type = 'mse'
+                print(f"🔍 Auto-detected continuous data → Using MSE loss")
+        
+        # Calculate loss based on type
+        if self.reconstruction_loss_type == 'bernoulli':
+            # Bernoulli loss for binary data
+            dist = distributions.Bernoulli(logits=reconstruction)
+            return -dist.log_prob(x_orig).sum() / z.shape[0]
+        
+        elif self.reconstruction_loss_type == 'mse':
+            # MSE loss for continuous data
+            return F.mse_loss(reconstruction, x_orig, reduction='sum') / z.shape[0]
+        
+        else:
+            raise ValueError(f"Unknown reconstruction_loss type: {self.reconstruction_loss_type}. "
+                           f"Must be 'auto', 'bernoulli', or 'mse'.")
     
     # def decode_deterministic(self, z: torch.Tensor) -> torch.Tensor:
     #     logits = self.decoder(z)

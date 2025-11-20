@@ -13,6 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 import tensorflow as tf
 from trieste.space import Box, DiscreteSearchSpace
 import torch
+from drone_dataset import DroneDataset
 from linear_vae import LinearVAE
 from twist_controller.sim.evolution.vae.abo import AsynchronousBO
 from weighted_dataset import WeightedDataset
@@ -25,24 +26,168 @@ class DebugCallback(pl.Callback):
 
 
 class VAE():
-    def __init__(self, cfg=None, dataset=None, wandb_run=None, optimizer=None, logger=None, optimizer_kwargs={}):
-         # Create arg parser
-        self.hparams = cfg if cfg is not None else get_vae_cfg()
-        self.hparams.dataset_path = dataset
-        # log_path = create_log_dir("pretrain", hparams.dataset, hparams.max_epochs, 1, note=f"ls{hparams.latent_dim}", log_folder_name=os.path.join(CILIA2D_ROOT_DIR, "logs", "retraining"))
-        self.log_path = self.hparams.log_dir 
-        self.n_workers = optimizer_kwargs.get("n_workers", 2)
-        self.use_result_buffer = optimizer_kwargs.get("use_result_buffer", True)
-        self.load_gp = optimizer_kwargs.get("load_gp", None)
-        self.likelihood_variance = optimizer_kwargs.get("likelihood_variance", 1e-3)
-        self.opt_bounds = optimizer_kwargs.get("opt_bounds", (-4, 4))
-        self.fitness_func = optimizer_kwargs.get("fitness_func", None)
+    """
+    Variational Autoencoder trainer for design optimization.
+    
+    Supports flexible dataset inputs - automatically handled by WeightedDataset:
+    - File paths (.pt, .npz, .pkl)
+    - NumPy arrays or PyTorch tensors
+    - Tuples of (data, properties)
+    - Dict with 'data' and 'properties' keys
+    - WeightedDataset instances
+    
+    Examples:
+        # From file path
+        >>> vae = VAE(dataset="data.pt", latent_dim=8, max_epochs=50)
+        
+        # From arrays with properties
+        >>> data = np.random.randn(1000, 128)
+        >>> scores = np.random.rand(1000)
+        >>> vae = VAE(dataset=(data, scores), latent_dim=16)
+        
+        # From array without properties (unweighted)
+        >>> data = np.random.randn(1000, 128)
+        >>> vae = VAE(dataset=data, latent_dim=8)
+        
+        # With black-box optimizer
+        >>> vae = VAE(dataset="data.pt", optimizer="abo", opt_bounds=(-4, 4))
+        
+        # Custom configuration
+        >>> vae = VAE(
+        ...     dataset="data.pt",
+        ...     latent_dim=16,
+        ...     hidden_dims=[1024, 256, 128],
+        ...     max_epochs=100,
+        ...     batch_size=256,
+        ...     weight_type="rank",
+        ...     rank_weight_k=0.001
+        ... )
+    """
+    
+    def __init__(
+        self, 
+        dataset,
+        # Model parameters
+        latent_dim: int = 8,
+        hidden_dims: list = None,
+        reconstruction_loss: str = 'auto',
+        # Training parameters
+        max_epochs: int = 80,
+        lr: float = 1e-3,
+        batch_size: int = 128,
+        val_frac: float = 0.05,
+        # VAE-specific training
+        beta_start: float = 1e-6,
+        beta_final: float = 1.0,
+        beta_step: float = 1.01,
+        beta_step_freq: int = 10,
+        beta_warmup: int = 10,
+        # Weighted sampling
+        property_key: str = "score",
+        weight_type: str = "rank",
+        rank_weight_k: float = 1e-3,
+        weight_quantile: float = None,
+        # Device and paths
+        device: str = "cuda:0",
+        log_dir: str = None,
+        load_from_checkpoint: str = None,
+        # Optimizer for design optimization (optional)
+        optimizer: str = None,
+        opt_bounds: tuple = (-4, 4),
+        n_workers: int = 2,
+        use_result_buffer: bool = True,
+        load_gp: str = None,
+        likelihood_variance: float = 1e-3,
+        # Logging
+        wandb_run=None,
+        logger=None,
+        seed: int = 10,
+    ):
+        """
+        Initialize VAE trainer.
+        
+        Args:
+            dataset: Dataset input (see WeightedDataset for supported formats)
+            latent_dim: Latent space dimension
+            hidden_dims: List of hidden layer sizes (default: [512, 128, 64, 64])
+            reconstruction_loss: Loss type ('auto', 'bernoulli', 'mse')
+                - 'auto': Automatically detect based on data (default)
+                - 'bernoulli': For binary data (0s and 1s)
+                - 'mse': For continuous data
+            max_epochs: Maximum training epochs
+            lr: Learning rate
+            batch_size: Training batch size
+            val_frac: Validation set fraction
+            beta_start: Initial KL weight (for beta-VAE)
+            beta_final: Final KL weight
+            beta_step: Beta annealing step multiplier
+            beta_step_freq: Steps between beta updates
+            beta_warmup: Warmup epochs before annealing
+            property_key: Key name for properties in files
+            weight_type: Weighting strategy ('rank', 'fb', etc.)
+            rank_weight_k: Rank weighting coefficient
+            weight_quantile: Quantile for filtering (fb mode)
+            device: Device ('cuda:0', 'cpu', etc.)
+            log_dir: Logging directory (auto-generated if None)
+            load_from_checkpoint: Path to checkpoint file
+            optimizer: Black-box optimizer type ('abo', etc.)
+            opt_bounds: Latent space bounds (lb, ub)
+            n_workers: Parallel workers for optimization
+            use_result_buffer: Cache optimization results
+            load_gp: Load Gaussian Process from path
+            likelihood_variance: GP likelihood variance
+            wandb_run: Existing W&B run instance
+            logger: Custom logger instance
+            seed: Random seed
+        """
+        # Setup configuration
+        if log_dir is None:
+            run_token = datetime.datetime.now().strftime("%m%d%H%M%S")
+            log_dir = os.path.join("exp", f"{run_token}")
+        
+        if hidden_dims is None:
+            hidden_dims = [512, 128, 64, 64]
+        
+        self.hparams = OmegaConf.create({
+            "seed": seed,
+            "batch_size": batch_size,
+            "lr": lr,
+            "val_frac": val_frac,
+            "wandb": wandb_run is not None,
+            "max_epochs": max_epochs,
+            "log_dir": log_dir,
+            "latent_dim": latent_dim,
+            "input_size": None,  # Set after data loading
+            "hidden_dims": hidden_dims,
+            "reconstruction_loss": reconstruction_loss,
+            "beta_start": beta_start,
+            "beta_final": beta_final,
+            "beta_step": beta_step,
+            "beta_step_freq": beta_step_freq,
+            "beta_warmup": beta_warmup,
+            "load_from_checkpoint": load_from_checkpoint,
+            "property_key": property_key,
+            "weight_type": weight_type,
+            "rank_weight_k": rank_weight_k,
+            "weight_quantile": weight_quantile,
+            "device": device,
+        })
+        
+        self.log_path = log_dir
+        self.n_workers = n_workers
+        self.use_result_buffer = use_result_buffer
+        self.load_gp = load_gp
+        self.likelihood_variance = likelihood_variance
+        self.opt_bounds = opt_bounds
         self.logger = logger
+        self._dataset_input = dataset
 
+        # Setup wandb logger
         if wandb_run is not None:
-            # The logger should use the existed wandb run automatically
-            self.wandb_logger = WandbLogger(config=OmegaConf.to_container(self.hparams), 
-                                            save_dir=self.log_path)
+            self.wandb_logger = WandbLogger(
+                config=OmegaConf.to_container(self.hparams), 
+                save_dir=self.log_path
+            )
         else:
             self.wandb_logger = None
         
@@ -56,38 +201,61 @@ class VAE():
 
 
     def _setup_vae(self):
+        """Setup VAE model, dataset, and trainer."""
         pl.seed_everything(self.hparams.seed)
-        # Create data
-        self.data = WeightedDataset(self.hparams)
+        
+        # Create dataset - WeightedDataset handles all input formats
+        if isinstance(self._dataset_input, WeightedDataset):
+            # Already a WeightedDataset instance
+            self.data = self._dataset_input
+        else:
+            # Let WeightedDataset handle all other formats
+            # (paths, arrays, tuples, dicts, etc.)
+            self.data = WeightedDataset(
+                data=self._dataset_input,
+                batch_size=self.hparams.batch_size,
+                val_frac=self.hparams.val_frac,
+                property_key=self.hparams.property_key,
+                weight_type=self.hparams.weight_type,
+                rank_weight_k=self.hparams.rank_weight_k,
+                weight_quantile=self.hparams.weight_quantile,
+            )
+        
         self.data.setup("init")
         self.hparams.input_size = self.data.data_shape[1]
 
         # Load model
         self.model = LinearVAE(self.hparams).to(device=torch.device(self.hparams.device))
         if self.hparams.load_from_checkpoint is not None:
-            self.model = LinearVAE.load_from_checkpoint(self.hparams.load_from_checkpoint, map_location=torch.device(self.hparams.device))
-            # utils.update_hparams(self.hparams, self.model) TODO: Fix this if further training is needed
-        # Data used for investigating the VAE
-        # self.model.max_idx = self.data.max_idx
-        # self.model.max_length = self.data.max_length
-        # self.model.sampled_original_data = self.data.sampled_original_data
+            self.model = LinearVAE.load_from_checkpoint(
+                self.hparams.load_from_checkpoint, 
+                map_location=torch.device(self.hparams.device)
+            )
 
-        # Main trainerx
+        # Main trainer
         self.trainer = pl.Trainer(
             accelerator="gpu",
             devices=[self.model.device.index] if self.model.device.type == 'cuda' else 'auto',
             default_root_dir=self.log_path,
             max_epochs=self.hparams.max_epochs,
-            callbacks=[pl.callbacks.ModelCheckpoint(
-                            every_n_epochs=1, monitor="loss/val", save_top_k=3,
-                            save_last=True,
-                            dirpath=self.log_path,
-                            filename="best",
-                        ), 
-                        RichProgressBar(theme=RichProgressBarTheme(progress_bar="red", progress_bar_finished="green")),
-                        LoggerCallback(),
-                        DebugCallback()
-                        ],
+            callbacks=[
+                pl.callbacks.ModelCheckpoint(
+                    every_n_epochs=1, 
+                    monitor="loss/val", 
+                    save_top_k=3,
+                    save_last=True,
+                    dirpath=self.log_path,
+                    filename="best",
+                ), 
+                RichProgressBar(
+                    theme=RichProgressBarTheme(
+                        progress_bar="red", 
+                        progress_bar_finished="green"
+                    )
+                ),
+                LoggerCallback(),
+                DebugCallback()
+            ],
             logger=self.wandb_logger,
         )
 
@@ -268,8 +436,22 @@ def get_vae_cfg():
     return cfg
 
 if __name__ == "__main__":
-
-    vae_trainer = VAE(optimizer="abo", dataset="designs_asym_filtered_onehot.pt")
+    # Example 1: Simple usage with file path
+    vae_trainer = VAE(dataset="designs_asym_filtered_onehot.pt")
+    vae_trainer.train_vae()
+    vae_trainer.test_vae()
+    
+    # Example 2: With custom dataset (e.g., from external source)
+    from drone_dataset import DroneDataset
+    drone_data = DroneDataset("/home/chen/LAB/CapyVAE/drone/log.txt")
+    configs, scores = drone_data.export_to_array(include_added_mass=False)
+    
+    vae_trainer = VAE(
+        dataset=(configs, scores),  # Pass as tuple
+        optimizer="abo",
+        latent_dim=8,
+        max_epochs=2
+    )
     vae_trainer.train_vae()
     vae_trainer.test_vae()
     init_designs = vae_trainer.get_init_designs()
